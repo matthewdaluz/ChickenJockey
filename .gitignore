@@ -1,0 +1,8 @@
+# ChickenJockey .gitignore
+*.exe
+*.obj
+*.pdb
+build/
+.vscode/
+CMakeFiles/
+CMakeCache.txt
