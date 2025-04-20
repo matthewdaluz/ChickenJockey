@@ -1,4 +1,4 @@
-#include "watcher.h"
+#include "utils/watcher.h"
 #include <windows.h>
 #include <iostream>
 #include <string>
@@ -69,15 +69,18 @@ bool RelaunchPeer(const std::string& peerRole, const std::string& exePath) {
 // RunWatcher: Main function for a watcher process.
 // Expects at least: --watchdog <A|B> and optionally a peerPID.
 int RunWatcher(int argc, char* argv[]) {
+    const int MAX_RESTARTS = 5;
+    int restartCount = 0;
+
     if (argc < 3) {
         std::cerr << "[Watcher] Insufficient arguments. Usage: --watchdog <A|B> [peerPID]" << std::endl;
         return 1;
     }
-    
-    // argv[1] is the flag "--watchdog", argv[2] holds the role ("A" or "B")
+
     std::string role = argv[2];
     std::string peerRole = (role == "A") ? "B" : "A";
     DWORD peerPID = 0;
+
     if (argc >= 4) {
         try {
             peerPID = std::stoul(argv[3]);
@@ -86,27 +89,23 @@ int RunWatcher(int argc, char* argv[]) {
             peerPID = 0;
         }
     }
-    
-    // Retrieve the full path of the current executable for relaunching peer process.
+
     char exePath[MAX_PATH] = {0};
     GetModuleFileNameA(NULL, exePath, MAX_PATH);
-    
+
     std::cout << "[Watcher " << role << "] Starting watcher process." << std::endl;
     std::cout << "[Watcher " << role << "] Monitoring hosts file and peer process (" 
               << (peerPID ? std::to_string(peerPID) : "not provided") << ")." << std::endl;
 
-    // Create a Blocker object so that we may reapply blocks if tampering is detected.
     Blocker blocker;
     const std::string hostsPath = "C:\\Windows\\System32\\drivers\\etc\\hosts";
     FILETIME lastWriteTime = GetLastWriteTime(hostsPath);
 
-    // Main monitoring loop.
     while (true) {
-        // 1. Monitor the hosts file for unauthorized modifications.
+        // Hosts file monitoring
         FILETIME currentWriteTime = GetLastWriteTime(hostsPath);
         if (IsFileTimeDifferent(lastWriteTime, currentWriteTime)) {
             std::cout << "[Watcher " << role << "] Detected hosts file modification." << std::endl;
-            // Check if the hosts file is in a blocked state; if not, reapply the block.
             if (!blocker.isBlocked()) {
                 std::cout << "[Watcher " << role << "] Tampering detected. Reapplying website blocks." << std::endl;
                 if (!blocker.reapplyBlock()) {
@@ -116,35 +115,37 @@ int RunWatcher(int argc, char* argv[]) {
             lastWriteTime = currentWriteTime;
         }
 
-        // 2. Monitor the peer process (if peerPID provided).
+        // Peer process monitoring and restart
+        bool shouldAttemptRestart = false;
+
         if (peerPID != 0) {
             HANDLE hPeer = OpenProcess(SYNCHRONIZE, FALSE, peerPID);
-            if (hPeer == NULL) {
-                std::cerr << "[Watcher " << role << "] Peer process (PID " << peerPID 
-                          << ") not found. Attempting to relaunch peer with role " << peerRole << "." << std::endl;
-                RelaunchPeer(peerRole, exePath);
-                // Reset peerPID after relaunch.
+            if (hPeer == NULL || WaitForSingleObject(hPeer, 0) == WAIT_OBJECT_0) {
+                std::cerr << "[Watcher " << role << "] Peer (PID " << peerPID << ") has exited or is unavailable." << std::endl;
+                shouldAttemptRestart = true;
+                if (hPeer) CloseHandle(hPeer);
                 peerPID = 0;
             } else {
-                DWORD waitStatus = WaitForSingleObject(hPeer, 0);
-                if (waitStatus == WAIT_OBJECT_0) {
-                    std::cerr << "[Watcher " << role << "] Peer process (PID " << peerPID 
-                              << ") has terminated. Relaunching peer with role " << peerRole << "." << std::endl;
-                    RelaunchPeer(peerRole, exePath);
-                    CloseHandle(hPeer);
-                    peerPID = 0;
-                } else {
-                    CloseHandle(hPeer);
-                }
+                CloseHandle(hPeer);
             }
         } else {
-            // 3. If no peer PID is provided (or it was reset), periodically attempt to ensure the peer is running.
-            std::cout << "[Watcher " << role << "] No peer PID provided. Verifying peer (role " 
-                      << peerRole << ") is active." << std::endl;
-            RelaunchPeer(peerRole, exePath);
+            std::cout << "[Watcher " << role << "] No peer PID. Checking if peer needs relaunch." << std::endl;
+            shouldAttemptRestart = true;
         }
-        
-        // 4. Sleep to minimize resource usage.
+
+        // Restart logic with cap
+        if (shouldAttemptRestart) {
+            if (restartCount >= MAX_RESTARTS) {
+                std::cerr << "[Watcher " << role << "] Max restart attempts for peer reached. Halting relaunch." << std::endl;
+            } else {
+                if (RelaunchPeer(peerRole, exePath)) {
+                    restartCount++;
+                    std::cout << "[Watcher " << role << "] Relaunch attempt #" << restartCount << std::endl;
+                }
+                std::this_thread::sleep_for(std::chrono::seconds(10)); // cooldown delay
+            }
+        }
+
         std::this_thread::sleep_for(std::chrono::seconds(5));
     }
 

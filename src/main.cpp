@@ -9,23 +9,31 @@
 
 // Internal modules
 #include "blocker.h"
-#include "watcher.h"
+#include "utils/watcher.h"
 #include "service.h"
 #include "gui.h"
-#include "crypto.h"   // Provides encryption functions
-#include "path.h"     // Provides random filename and hidden path utilities
+#include "crypto.h"
+#include "path.h"
+
+// Check for write permissions on the hosts file
+bool HasHostsWritePermission() {
+    HANDLE hFile = CreateFileA("C:\\Windows\\System32\\drivers\\etc\\hosts",
+                               GENERIC_WRITE, FILE_SHARE_WRITE, NULL,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile != INVALID_HANDLE_VALUE) {
+        CloseHandle(hFile);
+        return true;
+    }
+    return false;
+}
 
 // Dummy stubs for module initialization used in Debug Mode.
-// In the full implementation, these functions should perform proper initialization.
 bool InitializeBlocker() {
-    // For example, you might instantiate a Blocker and load a blocklist from a config.
     Blocker blocker;
-    // Assume initialization is successful.
     return true;
 }
 
 bool InitializeWatcher() {
-    // Similarly, initialize any state needed for watchdog processes.
     return true;
 }
 
@@ -56,7 +64,6 @@ void RunDebugMode() {
 // Optional: Test function for crypto (generates, encrypts, stores, then decrypts the password).
 void TestCryptoFunctions() {
     std::string storageDir = "C:\\ProgramData\\ChickenJockey";
-    // Ensure the storage directory exists using the PathUtil functions.
     if (!PathUtil::EnsureDirectoryExists(storageDir)) {
         std::cerr << "[Crypto Test] Failed to ensure storage directory exists." << std::endl;
         return;
@@ -76,15 +83,27 @@ void TestCryptoFunctions() {
     std::cout << "[Crypto Test] Password successfully decrypted." << std::endl;
 }
 
-// Main entry point that sets the mode based on command-line arguments.
 int main(int argc, char* argv[]) {
     std::cout << "----- Chicken Jockey Initialization -----" << std::endl;
-    
-    // Parse command-line arguments for mode selection.
+
+    // Check for required permission
+    if (!HasHostsWritePermission()) {
+        std::cerr << "[Error] This program requires administrative privileges to modify the hosts file." << std::endl;
+        MessageBoxA(NULL,
+            "Chicken Jockey requires administrator rights to block websites.\n\n"
+            "Please run this program as Administrator.",
+            "Permission Denied",
+            MB_ICONERROR | MB_OK);
+        return EXIT_FAILURE;
+    }
+
+    // Command-line argument flags
     bool debugMode = false;
     bool guiMode = false;
     bool cryptoTest = false;
-    
+    bool installService = false;
+
+    // Parse command-line arguments
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--debug" || arg == "-debug") {
@@ -93,21 +112,32 @@ int main(int argc, char* argv[]) {
             guiMode = true;
         } else if (arg == "--test-crypto") {
             cryptoTest = true;
+        } else if (arg == "--install-service" || arg == "-install-service") {
+            installService = true;
         }
     }
-    
+
+    if (installService) {
+        if (!InstallService()) {
+            std::cerr << "[Installer] Failed to install service." << std::endl;
+            return EXIT_FAILURE;
+        }
+        std::cout << "[Installer] Service installed. You can now start it with `sc start ChickenJockeyService`." << std::endl;
+        return EXIT_SUCCESS;
+    }
+
     if (cryptoTest) {
         TestCryptoFunctions();
         return EXIT_SUCCESS;
     }
-    
+
     if (guiMode) {
         std::cout << "Launching GUI for initial configuration." << std::endl;
         int guiResult = RunGUI();
         std::cout << "GUI configuration completed with exit code: " << guiResult << std::endl;
         return guiResult;
     }
-    
+
     if (debugMode) {
         std::cout << "Running in Debug Mode." << std::endl;
         try {
@@ -123,7 +153,7 @@ int main(int argc, char* argv[]) {
             return EXIT_FAILURE;
         }
     }
-    
+
     std::cout << "Chicken Jockey exiting." << std::endl;
     return EXIT_SUCCESS;
 }

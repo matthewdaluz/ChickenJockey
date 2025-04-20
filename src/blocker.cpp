@@ -99,31 +99,61 @@ bool Blocker::applyBlock() {
         std::cerr << "[Error] No domains loaded to block." << std::endl;
         return false;
     }
-    
-    // Backup the hosts file before making changes.
+
     if (!backupHosts()) {
         std::cerr << "[Error] Unable to backup hosts file. Aborting block application." << std::endl;
         return false;
     }
-    
+
+    // Step 1: Read existing hosts file and preserve all lines outside our markers.
+    std::ifstream inFile(m_hostsPath);
+    if (!inFile.is_open()) {
+        std::cerr << "[Error] Failed to open hosts file for reading: " << m_hostsPath << std::endl;
+        return false;
+    }
+
+    std::ostringstream preservedLines;
+    std::string line;
+    bool insideBlock = false;
+
+    while (std::getline(inFile, line)) {
+        if (line.find(BLOCK_START_MARKER) != std::string::npos) {
+            insideBlock = true;
+            continue;
+        }
+        if (line.find(BLOCK_END_MARKER) != std::string::npos) {
+            insideBlock = false;
+            continue;
+        }
+        if (!insideBlock) {
+            preservedLines << line << "\n";
+        }
+    }
+
+    inFile.close();
+
+    // Step 2: Open hosts file for writing and inject new blocklist.
     std::ofstream outFile(m_hostsPath, std::ios::out | std::ios::trunc);
     if (!outFile.is_open()) {
         std::cerr << "[Error] Failed to open hosts file for writing: " << m_hostsPath << std::endl;
         return false;
     }
-    
-    // Write a header and block section markers.
+
+    outFile << preservedLines.str();
     outFile << "# This hosts file has been modified by ChickenJockey.\n";
     outFile << BLOCK_START_MARKER << "\n";
+
     for (const auto& domain : m_domains) {
         outFile << "127.0.0.1 " << domain << "\n";
     }
+
     outFile << BLOCK_END_MARKER << "\n";
     outFile.close();
-    
-    std::cout << "[Info] Hosts file updated with block entries." << std::endl;
+
+    std::cout << "[Info] Hosts file updated with preserved entries and new block entries." << std::endl;
     return true;
 }
+
 
 // Check if the hosts file is in a blocked state by looking for our markers.
 bool Blocker::isBlocked() {

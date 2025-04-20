@@ -227,3 +227,50 @@ void CleanupWatchdogProcesses()
         g_ProcessBInfo.hProcess = NULL;
     }
 }
+
+std::wstring GetExecutablePath() {
+    wchar_t buffer[MAX_PATH];
+    DWORD length = GetModuleFileNameW(NULL, buffer, MAX_PATH);
+    if (length == 0 || length == MAX_PATH) {
+        std::wcerr << L"[Error] Unable to get executable path." << std::endl;
+        return L"";
+    }
+    return std::wstring(buffer);
+}
+
+bool InstallService() {
+    std::wstring exePath = GetExecutablePath();
+
+    SC_HANDLE hSCManager = OpenSCManager(NULL, NULL, SC_MANAGER_CREATE_SERVICE);
+    if (!hSCManager) {
+        std::wcerr << L"[Installer] Failed to open Service Control Manager. Error: " << GetLastError() << std::endl;
+        return false;
+    }
+
+    SC_HANDLE hService = CreateService(
+        hSCManager,
+        L"ChickenJockeyService",
+        L"Chicken Jockey Blocking Service",
+        SERVICE_ALL_ACCESS,
+        SERVICE_WIN32_OWN_PROCESS,
+        SERVICE_AUTO_START,
+        SERVICE_ERROR_NORMAL,
+        exePath.c_str(),
+        NULL, NULL, NULL, NULL, NULL);
+
+    if (!hService) {
+        DWORD err = GetLastError();
+        if (err == ERROR_SERVICE_EXISTS) {
+            std::wcout << L"[Installer] Service already exists." << std::endl;
+        } else {
+            std::wcerr << L"[Installer] Failed to create service. Error: " << err << std::endl;
+        }
+        CloseServiceHandle(hSCManager);
+        return false;
+    }
+
+    std::wcout << L"[Installer] ChickenJockeyService installed successfully." << std::endl;
+    CloseServiceHandle(hService);
+    CloseServiceHandle(hSCManager);
+    return true;
+}
