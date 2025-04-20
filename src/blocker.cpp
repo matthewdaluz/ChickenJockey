@@ -1,120 +1,234 @@
+// blocker.cpp
 #include "blocker.h"
 #include <fstream>
 #include <iostream>
 #include <sstream>
-#include <filesystem>   // Requires C++17
 #include <algorithm>
 #include <cctype>
+#include <system_error>
+#include <windows.h>
+#include <aclapi.h>
 
 namespace fs = std::filesystem;
 
-// Constructor: sets the paths for the hosts file and backup.
-Blocker::Blocker(const std::string& hostsPath, const std::string& backupPath)
-    : m_hostsPath(hostsPath), m_backupPath(backupPath) 
-{
+
+// Debug logging helpers
+void Blocker::debugLog(const std::string& message) const {
+    if (m_debugMode) {
+        std::cout << "[DEBUG] " << message << std::endl;
+    }
 }
 
-// Utility: trim whitespace from both ends of a string.
-std::string Blocker::trim(const std::string& str) {
-    std::string s = str;
-    s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](unsigned char ch) {
-        return !std::isspace(ch);
-    }));
-    s.erase(std::find_if(s.rbegin(), s.rend(), [](unsigned char ch) {
-        return !std::isspace(ch);
-    }).base(), s.end());
-    return s;
+void Blocker::debugLog(const std::wstring& message) const {
+    if (m_debugMode) {
+        std::wcout << L"[DEBUG] " << message << std::endl;
+    }
 }
 
-// Load domains from a vector of strings.
+// Constructor
+Blocker::Blocker(const fs::path& hostsPath, const fs::path& backupPath, bool debugMode)
+    : m_hostsPath(hostsPath), m_backupPath(backupPath), m_debugMode(debugMode) {
+    debugLog("Blocker constructor called");
+    debugLog(L"Hosts path: " + m_hostsPath.wstring());
+    debugLog(L"Backup path: " + m_backupPath.wstring());
+}
+
+// Trim whitespace
+std::string Blocker::trim(const std::string& str) const {
+    debugLog("Trimming string: " + str);
+    auto start = std::find_if_not(str.begin(), str.end(), [](unsigned char c) {
+        return std::isspace(c);
+    });
+    auto end = std::find_if_not(str.rbegin(), str.rend(), [](unsigned char c) {
+        return std::isspace(c);
+    }).base();
+    return (start < end) ? std::string(start, end) : "";
+}
+
+// Check admin privileges (Windows-specific)
+bool Blocker::checkAdminPrivileges() const {
+    debugLog("Checking admin privileges");
+    BOOL isAdmin = FALSE;
+    PSID adminGroup = NULL;
+    SID_IDENTIFIER_AUTHORITY NtAuthority = SECURITY_NT_AUTHORITY;
+
+    if (!AllocateAndInitializeSid(&NtAuthority, 2, SECURITY_BUILTIN_DOMAIN_RID, 
+                                 DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &adminGroup)) {
+        debugLog("Failed to allocate and initialize SID");
+        return false;
+    }
+
+    if (!CheckTokenMembership(NULL, adminGroup, &isAdmin)) {
+        isAdmin = FALSE;
+        debugLog("Failed to check token membership");
+    }
+
+    FreeSid(adminGroup);
+    debugLog(isAdmin ? "User has admin privileges" : "User does not have admin privileges");
+    return isAdmin == TRUE;
+}
+
+// New writing stuff.
+bool Blocker::secureWrite(const fs::path& path, const std::string& content) const {
+    debugLog("Starting secureWrite operation");
+    fs::path tempPath = path;
+    tempPath += ".tmp";
+    debugLog(L"Temporary file path: " + tempPath.wstring());
+
+    try {
+        {
+            debugLog("Creating temporary file");
+            std::ofstream ofs(tempPath, std::ios::binary);
+            if (!ofs) {
+                debugLog("Failed to open temporary file");
+                return false;
+            }
+            ofs.exceptions(std::ofstream::failbit | std::ofstream::badbit);
+            ofs << content;
+            debugLog("Content written to temporary file");
+        }
+
+        // Construct path to hostswriter.exe
+        wchar_t exePath[MAX_PATH];
+        GetModuleFileNameW(NULL, exePath, MAX_PATH);
+        std::wstring exeDir = fs::path(exePath).parent_path();
+        std::wstring writerPath = exeDir + L"\\hostswriter.exe";
+        debugLog(L"hostswriter.exe path: " + writerPath);
+
+        // Arguments: "<tempPath>" "<targetPath>"
+        std::wstring args = L"\"" + tempPath.wstring() + L"\" \"" + path.wstring() + L"\"";
+        debugLog(L"Process arguments: " + args);
+
+        // Launch elevated process
+        SHELLEXECUTEINFOW sei = { sizeof(sei) };
+        sei.lpVerb = L"runas";
+        sei.lpFile = writerPath.c_str();
+        sei.lpParameters = args.c_str();
+        sei.nShow = SW_HIDE;
+        sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+        
+        debugLog("Attempting to launch hostswriter.exe with elevation");
+        if (!ShellExecuteExW(&sei) || !sei.hProcess) {
+            debugLog("Failed to launch hostswriter.exe with elevation");
+            std::wcerr << L"[Blocker] Failed to launch hostswriter.exe with elevation.\n";
+            fs::remove(tempPath);
+            return false;
+        }
+        
+        debugLog("Waiting for hostswriter.exe to complete");
+        WaitForSingleObject(sei.hProcess, INFINITE);
+
+        DWORD exitCode = 1;
+        GetExitCodeProcess(sei.hProcess, &exitCode);
+        CloseHandle(sei.hProcess);
+        debugLog(L"hostswriter.exe exit code: " + std::to_wstring(exitCode));
+
+        // Always delete the temp file, regardless of success/failure
+        std::error_code ec;
+        fs::remove(tempPath, ec);
+        if (ec) {
+            debugLog("Failed to remove temporary file: " + std::string(ec.message()));
+        }
+
+        if (exitCode != 0) {
+            debugLog("hostswriter.exe returned error");
+            std::wcerr << L"[Blocker] hostswriter.exe returned error: " << exitCode << std::endl;
+            return false;
+        }
+
+        if (!fs::exists(path)) {
+            debugLog("Hosts file was not created after hostswriter execution");
+            std::wcerr << L"[Blocker] Hosts file was not created after hostswriter execution.\n";
+            return false;
+        }
+
+        debugLog("hostswriter.exe succeeded");
+        std::wcout << L"[Blocker] hostswriter.exe succeeded.\n";
+        return true;
+    } catch (const std::exception& e) {
+        debugLog("Exception in secureWrite: " + std::string(e.what()));
+        std::cerr << "[Blocker] Secure write error: " << e.what() << std::endl;
+        std::error_code ec;
+        fs::remove(tempPath, ec);
+        return false;
+    }
+}
+
+// Load domains - single combined implementation
 bool Blocker::loadDomains(const std::vector<std::string>& domains) {
-    m_domains = domains;
-    if (m_domains.empty()) {
+    debugLog("Loading domains from vector");
+    if (domains.empty()) {
+        debugLog("Domain list is empty");
         std::cerr << "[Error] Domain list is empty." << std::endl;
         return false;
     }
-    std::cout << "[Info] Loaded " << m_domains.size() << " domain(s) to block." << std::endl;
+
+    m_domains = domains;
+    debugLog("Loaded " + std::to_string(m_domains.size()) + " domain(s)");
+    std::cout << "[Info] Loaded " << m_domains.size() << " domain(s).\n";
     return true;
 }
 
-// Load domains from a uBlock Origin–style hosts file.
-// Expects lines like "0.0.0.0 example.com" or "127.0.0.1 example.com".
-bool Blocker::loadDomainsFromFile(const std::string& filePath) {
-    std::ifstream inFile(filePath);
-    if (!inFile.is_open()) {
-        std::cerr << "[Error] Unable to open file: " << filePath << std::endl;
-        return false;
-    }
-    
-    m_domains.clear();
-    std::string line;
-    while (std::getline(inFile, line)) {
-        line = trim(line);
-        // Skip empty lines and comments.
-        if (line.empty() || line[0] == '#')
-            continue;
-        
-        std::istringstream iss(line);
-        std::string ip, domain;
-        if (!(iss >> ip >> domain)) {
-            continue;  // Skip if parsing fails.
-        }
-        // Accept only entries with 0.0.0.0 or 127.0.0.1.
-        if (ip == "0.0.0.0" || ip == "127.0.0.1") {
-            m_domains.push_back(domain);
-        }
-    }
-    inFile.close();
-    
-    if (m_domains.empty()) {
-        std::cerr << "[Error] No domains loaded from file: " << filePath << std::endl;
-        return false;
-    }
-    
-    std::cout << "[Info] Loaded " << m_domains.size() << " domain(s) from file: " << filePath << std::endl;
-    return true;
-}
 
-// Backup the current hosts file using std::filesystem.
+// Backup hosts file
 bool Blocker::backupHosts() {
+    if (!checkAdminPrivileges()) {
+        std::cerr << "[Error] Admin rights required for backup." << std::endl;
+        return false;
+    }
+
     try {
-        // Ensure the backup directory exists.
-        fs::path backupDir = fs::path(m_backupPath).parent_path();
-        if (!fs::exists(backupDir)) {
-            fs::create_directories(backupDir);
-        }
-        // Copy the hosts file to the backup location (overwrite if already exists).
+        fs::create_directories(m_backupPath.parent_path());
         fs::copy_file(m_hostsPath, m_backupPath, fs::copy_options::overwrite_existing);
-        std::cout << "[Info] Hosts file backed up to: " << m_backupPath << std::endl;
+        fs::permissions(m_backupPath,
+            fs::perms::owner_read | fs::perms::owner_write,
+            fs::perm_options::replace);
+        
+        std::cout << "[Info] Backup created: " << m_backupPath << std::endl;
+        return true;
     } catch (const fs::filesystem_error& e) {
         std::cerr << "[Error] Backup failed: " << e.what() << std::endl;
         return false;
     }
-    return true;
 }
 
-// Overwrite the hosts file with block entries for each domain.
+// Apply block
 bool Blocker::applyBlock() {
+    if (!checkAdminPrivileges()) {
+        std::cerr << "[Error] Admin rights required to modify hosts file." << std::endl;
+        return false;
+    }
+
     if (m_domains.empty()) {
-        std::cerr << "[Error] No domains loaded to block." << std::endl;
+        std::cerr << "[Error] No domains to block." << std::endl;
         return false;
     }
 
-    if (!backupHosts()) {
-        std::cerr << "[Error] Unable to backup hosts file. Aborting block application." << std::endl;
-        return false;
+    // Automatically create backup if it doesn't exist
+    try {
+        if (!fs::exists(m_backupPath)) {
+            fs::create_directories(m_backupPath.parent_path());
+            fs::copy_file(m_hostsPath, m_backupPath, fs::copy_options::overwrite_existing);
+            fs::permissions(m_backupPath,
+                fs::perms::owner_read | fs::perms::owner_write,
+                fs::perm_options::replace);
+            std::cout << "[Info] Auto-backup created: " << m_backupPath << std::endl;
+        }
+    } catch (const fs::filesystem_error& e) {
+        std::cerr << "[Warning] Failed to auto-create backup: " << e.what() << std::endl;
+        // Continue anyway — not critical unless factory reset happens
     }
 
-    // Step 1: Read existing hosts file and preserve all lines outside our markers.
+    // Read existing content
     std::ifstream inFile(m_hostsPath);
-    if (!inFile.is_open()) {
-        std::cerr << "[Error] Failed to open hosts file for reading: " << m_hostsPath << std::endl;
+    if (!inFile) {
+        std::cerr << "[Error] Can't read hosts file." << std::endl;
         return false;
     }
 
-    std::ostringstream preservedLines;
-    std::string line;
+    std::ostringstream content;
     bool insideBlock = false;
+    std::string line;
 
     while (std::getline(inFile, line)) {
         if (line.find(BLOCK_START_MARKER) != std::string::npos) {
@@ -126,72 +240,56 @@ bool Blocker::applyBlock() {
             continue;
         }
         if (!insideBlock) {
-            preservedLines << line << "\n";
+            content << line << '\n';
         }
     }
 
-    inFile.close();
+    // Build new content
+    std::ostringstream newContent;
+    newContent << content.str()
+               << "# Managed by ChickenJockey\n"
+               << BLOCK_START_MARKER << '\n';
+    
+    for (const auto& domain : m_domains) {
+        newContent << "127.0.0.1 " << domain << '\n';
+    }
+    
+    newContent << BLOCK_END_MARKER << '\n';
 
-    // Step 2: Open hosts file for writing and inject new blocklist.
-    std::ofstream outFile(m_hostsPath, std::ios::out | std::ios::trunc);
-    if (!outFile.is_open()) {
-        std::cerr << "[Error] Failed to open hosts file for writing: " << m_hostsPath << std::endl;
+    // Atomic write
+    if (!secureWrite(m_hostsPath, newContent.str())) {
+        std::cerr << "[Error] Failed to update hosts file." << std::endl;
         return false;
     }
 
-    outFile << preservedLines.str();
-    outFile << "# This hosts file has been modified by ChickenJockey.\n";
-    outFile << BLOCK_START_MARKER << "\n";
-
-    for (const auto& domain : m_domains) {
-        outFile << "127.0.0.1 " << domain << "\n";
-    }
-
-    outFile << BLOCK_END_MARKER << "\n";
-    outFile.close();
-
-    std::cout << "[Info] Hosts file updated with preserved entries and new block entries." << std::endl;
+    std::cout << "[Info] Hosts file updated successfully.\n";
     return true;
 }
 
 
-// Check if the hosts file is in a blocked state by looking for our markers.
+// Check block status
 bool Blocker::isBlocked() {
     std::ifstream inFile(m_hostsPath);
-    if (!inFile.is_open()) {
-        std::cerr << "[Error] Unable to open hosts file for reading: " << m_hostsPath << std::endl;
-        return false;
-    }
-    
+    if (!inFile) return false;
+
+    bool foundStart = false, foundEnd = false;
     std::string line;
-    bool foundStart = false;
-    bool foundEnd = false;
+
     while (std::getline(inFile, line)) {
-        if (line.find(BLOCK_START_MARKER) != std::string::npos) {
-            foundStart = true;
-        }
-        if (line.find(BLOCK_END_MARKER) != std::string::npos) {
-            foundEnd = true;
-        }
-        if (foundStart && foundEnd)
-            break;
+        if (line.find(BLOCK_START_MARKER) != std::string::npos) foundStart = true;
+        if (line.find(BLOCK_END_MARKER) != std::string::npos) foundEnd = true;
+        if (foundStart && foundEnd) break;
     }
-    inFile.close();
-    
-    if (foundStart && foundEnd)
-        std::cout << "[Info] Hosts file is currently in a blocked state." << std::endl;
-    else
-        std::cout << "[Info] Hosts file is NOT in a blocked state." << std::endl;
-    
+
     return foundStart && foundEnd;
 }
 
-// Reapply the block if the existing block markers are missing.
+// Reapply block
 bool Blocker::reapplyBlock() {
     if (!isBlocked()) {
-        std::cout << "[Warning] Tampering detected. Reapplying block." << std::endl;
+        std::cout << "[Warning] Block compromised - reapplying.\n";
         return applyBlock();
     }
-    std::cout << "[Info] No tampering detected. Block remains intact." << std::endl;
+    std::cout << "[Info] Block integrity verified.\n";
     return true;
 }

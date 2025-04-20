@@ -1,153 +1,211 @@
-#include "utils/watcher.h"
+// watcher.cpp
+#include "watcher.h"
+#include "blocker.h"
 #include <windows.h>
 #include <iostream>
-#include <string>
+#include <sstream>
 #include <thread>
 #include <chrono>
-#include "blocker.h"
+#include <vector>
+#include <stringapiset.h>
 
-// Helper: Retrieve the last modified FILETIME for a given file.
-FILETIME GetLastWriteTime(const std::string& filePath) {
-    FILETIME ftWrite = {0};
-    HANDLE hFile = CreateFileA(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile != INVALID_HANDLE_VALUE) {
-        BY_HANDLE_FILE_INFORMATION fileInfo;
-        if (GetFileInformationByHandle(hFile, &fileInfo)) {
-            ftWrite = fileInfo.ftLastWriteTime;
+namespace fs = std::filesystem;  // Filesystem namespace alias
+
+namespace {
+
+constexpr DWORD MAX_RESTARTS = 5;
+constexpr std::chrono::seconds MONITOR_INTERVAL(5);
+constexpr std::chrono::seconds RESTART_COOLDOWN(10);
+constexpr DWORD MAX_PATH_LENGTH = 32767;
+
+// Secure command line construction
+std::wstring CreateCommandLine(const std::wstring& exePath, const std::wstring& role) {
+    std::wostringstream oss;
+    oss << L"\"" << exePath << L"\" --watchdog " << role;
+    return oss.str();
+}
+
+// RAII wrapper for process creation
+struct ProcessGuard {
+    PROCESS_INFORMATION pi{};
+    ~ProcessGuard() {
+        if (pi.hProcess) CloseHandle(pi.hProcess);
+        if (pi.hThread) CloseHandle(pi.hThread);
+    }
+};
+
+} // anonymous namespace
+
+namespace utils {
+
+// Initialize static method
+bool Watcher::Initialize() {
+    std::wcout << L"[Watcher] Initializing watchdog system\n";
+    return true; // Initialization logic placeholder
+}
+
+int Watcher::Run(int argc, char* argv[]) {
+    try {
+        auto [pid, role, exe_path] = ParseArguments(argc, argv); // Fixed structured binding
+        Blocker blocker;
+        fs::path hostsPath = L"C:\\Windows\\System32\\drivers\\etc\\hosts";
+        FILETIME lastWriteTime = GetLastWriteTime(hostsPath);
+        int restartCount = 0;
+
+        std::wcout << L"[Watcher " << role.c_str() << L"] Monitoring system (PID: " 
+                  << GetCurrentProcessId() << L")\n";
+
+        while (true) {
+            if (!MonitorHostsFile(blocker, hostsPath, lastWriteTime)) {
+                std::cerr << "[Critical] Hosts file monitoring failed\n";
+                return EXIT_FAILURE;
+            }
+
+            if (!MonitorPeerProcess(pid, {pid, role, exe_path}, restartCount)) { // Fixed struct init
+                std::cerr << "[Critical] Peer monitoring failed\n";
+                return EXIT_FAILURE;
+            }
+
+            std::this_thread::sleep_for(MONITOR_INTERVAL);
         }
-        CloseHandle(hFile);
+    } catch (const std::exception& e) {
+        std::cerr << "[Fatal Error] " << e.what() << '\n';
+        return EXIT_FAILURE;
     }
-    return ftWrite;
+    return EXIT_SUCCESS;
 }
 
-// Helper: Compare two FILETIME structures.
-bool IsFileTimeDifferent(const FILETIME& ft1, const FILETIME& ft2) {
-    return (ft1.dwLowDateTime != ft2.dwLowDateTime) || (ft1.dwHighDateTime != ft2.dwHighDateTime);
-}
-
-// Helper: Relaunch the peer process given its role, using our own executable path.
-bool RelaunchPeer(const std::string& peerRole, const std::string& exePath) {
-    std::string commandLine = "\"" + exePath + "\" --watchdog " + peerRole;
-    STARTUPINFOA si;
-    PROCESS_INFORMATION pi;
-    ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
-    ZeroMemory(&pi, sizeof(pi));
-
-    // CreateProcess requires a modifiable C-string.
-    char* cmdLineCStr = new char[commandLine.size() + 1];
-    strcpy_s(cmdLineCStr, commandLine.size() + 1, commandLine.c_str());
-
-    BOOL result = CreateProcessA(
-        NULL,              // No module name—use command line.
-        cmdLineCStr,       // Command line buffer.
-        NULL,              // Process handle not inheritable.
-        NULL,              // Thread handle not inheritable.
-        FALSE,             // Do not inherit handles.
-        0,                 // No creation flags.
-        NULL,              // Use parent's environment.
-        NULL,              // Use parent's current directory.
-        &si,
-        &pi
-    );
-
-    delete[] cmdLineCStr;
-    
-    if (!result) {
-        std::cerr << "[Watcher] Error: Failed to relaunch peer process with role " << peerRole 
-                  << ". Error code: " << GetLastError() << std::endl;
-        return false;
-    }
-    
-    std::cout << "[Watcher] Successfully relaunched peer process with role " << peerRole << "." << std::endl;
-    // Immediately close the process and thread handles.
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-    return true;
-}
-
-// RunWatcher: Main function for a watcher process.
-// Expects at least: --watchdog <A|B> and optionally a peerPID.
-int RunWatcher(int argc, char* argv[]) {
-    const int MAX_RESTARTS = 5;
-    int restartCount = 0;
-
+Watcher::ProcessInfo Watcher::ParseArguments(int argc, char* argv[]) {
     if (argc < 3) {
-        std::cerr << "[Watcher] Insufficient arguments. Usage: --watchdog <A|B> [peerPID]" << std::endl;
-        return 1;
+        throw std::invalid_argument("Insufficient arguments. Usage: --watchdog <A|B> [peerPID]");
     }
 
-    std::string role = argv[2];
-    std::string peerRole = (role == "A") ? "B" : "A";
-    DWORD peerPID = 0;
+    ProcessInfo info;
+    info.role = argv[2];
+    if (info.role != "A" && info.role != "B") {
+        throw std::invalid_argument("Invalid role. Must be 'A' or 'B'");
+    }
+
+    wchar_t exePath[MAX_PATH_LENGTH];
+    if (!GetModuleFileNameW(nullptr, exePath, MAX_PATH_LENGTH)) {
+        throw std::runtime_error("Failed to get executable path");
+    }
+    info.exe_path = fs::path(exePath);
 
     if (argc >= 4) {
         try {
-            peerPID = std::stoul(argv[3]);
+            info.pid = std::stoul(argv[3]);
         } catch (...) {
-            std::cerr << "[Watcher " << role << "] Warning: Invalid peerPID argument. Defaulting to peer not provided." << std::endl;
-            peerPID = 0;
+            std::cerr << "[Warning] Invalid peer PID format\n";
+            info.pid = 0;
         }
     }
 
-    char exePath[MAX_PATH] = {0};
-    GetModuleFileNameA(NULL, exePath, MAX_PATH);
-
-    std::cout << "[Watcher " << role << "] Starting watcher process." << std::endl;
-    std::cout << "[Watcher " << role << "] Monitoring hosts file and peer process (" 
-              << (peerPID ? std::to_string(peerPID) : "not provided") << ")." << std::endl;
-
-    Blocker blocker;
-    const std::string hostsPath = "C:\\Windows\\System32\\drivers\\etc\\hosts";
-    FILETIME lastWriteTime = GetLastWriteTime(hostsPath);
-
-    while (true) {
-        // Hosts file monitoring
-        FILETIME currentWriteTime = GetLastWriteTime(hostsPath);
-        if (IsFileTimeDifferent(lastWriteTime, currentWriteTime)) {
-            std::cout << "[Watcher " << role << "] Detected hosts file modification." << std::endl;
-            if (!blocker.isBlocked()) {
-                std::cout << "[Watcher " << role << "] Tampering detected. Reapplying website blocks." << std::endl;
-                if (!blocker.reapplyBlock()) {
-                    std::cerr << "[Watcher " << role << "] Error: Failed to reapply website block." << std::endl;
-                }
-            }
-            lastWriteTime = currentWriteTime;
-        }
-
-        // Peer process monitoring and restart
-        bool shouldAttemptRestart = false;
-
-        if (peerPID != 0) {
-            HANDLE hPeer = OpenProcess(SYNCHRONIZE, FALSE, peerPID);
-            if (hPeer == NULL || WaitForSingleObject(hPeer, 0) == WAIT_OBJECT_0) {
-                std::cerr << "[Watcher " << role << "] Peer (PID " << peerPID << ") has exited or is unavailable." << std::endl;
-                shouldAttemptRestart = true;
-                if (hPeer) CloseHandle(hPeer);
-                peerPID = 0;
-            } else {
-                CloseHandle(hPeer);
-            }
-        } else {
-            std::cout << "[Watcher " << role << "] No peer PID. Checking if peer needs relaunch." << std::endl;
-            shouldAttemptRestart = true;
-        }
-
-        // Restart logic with cap
-        if (shouldAttemptRestart) {
-            if (restartCount >= MAX_RESTARTS) {
-                std::cerr << "[Watcher " << role << "] Max restart attempts for peer reached. Halting relaunch." << std::endl;
-            } else {
-                if (RelaunchPeer(peerRole, exePath)) {
-                    restartCount++;
-                    std::cout << "[Watcher " << role << "] Relaunch attempt #" << restartCount << std::endl;
-                }
-                std::this_thread::sleep_for(std::chrono::seconds(10)); // cooldown delay
-            }
-        }
-
-        std::this_thread::sleep_for(std::chrono::seconds(5));
-    }
-
-    return 0;
+    return info;
 }
+
+FILETIME Watcher::GetLastWriteTime(const fs::path& filePath) {
+    // CreateFileW returns a raw HANDLE, we wrap it with HandleGuard
+    HandleGuard hFile(CreateFileW(
+        filePath.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr
+    ));
+
+    if (!hFile || hFile == INVALID_HANDLE_VALUE) {
+        throw std::runtime_error("Failed to open file for timestamp check");
+    }
+
+    FILETIME ftWrite{};
+    if (!GetFileTime(hFile, nullptr, nullptr, &ftWrite)) {
+        throw std::runtime_error("Failed to get file timestamp");
+    }
+
+    return ftWrite;
+}
+
+
+bool Watcher::IsFileModified(const FILETIME& previous, const fs::path& filePath) {
+    const FILETIME current = GetLastWriteTime(filePath);
+    return CompareFileTime(&previous, &current) != 0;
+}
+
+bool Watcher::MonitorHostsFile(Blocker& blocker, const fs::path& hostsPath, FILETIME& lastWriteTime) {
+    try {
+        if (IsFileModified(lastWriteTime, hostsPath)) {
+            std::wcout << L"[Watcher] Hosts file modification detected\n";
+            
+            if (!blocker.isBlocked() && !blocker.reapplyBlock()) {
+                std::cerr << "[Error] Failed to restore block\n";
+                return false;
+            }
+
+            lastWriteTime = GetLastWriteTime(hostsPath);
+        }
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "[Monitor Error] " << e.what() << '\n';
+        return false;
+    }
+}
+
+bool Watcher::RestartPeer(const ProcessInfo& info, const std::string& peerRole) {
+    // Proper wide-string conversion
+    const std::wstring wPeerRole(peerRole.begin(), peerRole.end());
+    const std::wstring commandLine = CreateCommandLine(info.exe_path.wstring(), wPeerRole);
+
+    STARTUPINFOW si = { sizeof(STARTUPINFOW) };
+    ProcessGuard process;
+
+    if (!CreateProcessW(
+        nullptr,
+        const_cast<wchar_t*>(commandLine.c_str()),
+        nullptr,
+        nullptr,
+        FALSE,
+        CREATE_NEW_CONSOLE,
+        nullptr,
+        nullptr,
+        &si,
+        &process.pi
+    )) {
+        std::cerr << "[Restart Error] CreateProcess failed (" << GetLastError() << ")\n";
+        return false;
+    }
+
+    std::wcout << L"[Watcher] Successfully restarted peer " << wPeerRole 
+              << L" (PID: " << process.pi.dwProcessId << L")\n";
+    return true;
+}
+
+bool Watcher::MonitorPeerProcess(DWORD& peerPID, const ProcessInfo& info, int& restartCount) {
+    if (peerPID == 0) {
+        if (restartCount < MAX_RESTARTS && RestartPeer(info, info.role == "A" ? "B" : "A")) {
+            restartCount++;
+            std::this_thread::sleep_for(RESTART_COOLDOWN);
+        }
+        return true;
+    }
+
+    HandleGuard hProcess(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, peerPID));
+    if (!hProcess || hProcess == INVALID_HANDLE_VALUE) {
+        std::cerr << "[Peer Error] Process " << peerPID << " not found\n";
+        peerPID = 0;
+        return true;
+    }
+    
+    DWORD exitCode = STILL_ACTIVE;
+    if (!GetExitCodeProcess(hProcess, &exitCode) || exitCode != STILL_ACTIVE) {
+        std::cerr << "[Peer Alert] Process " << peerPID << " terminated\n";
+        peerPID = 0;
+    }
+    
+
+    return true;
+}
+
+} // namespace utils
